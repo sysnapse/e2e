@@ -28,6 +28,13 @@ jobs:
     name: rakazo web e2e @ ${{ inputs.sha }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # 流程.md §21.3b(a)：e2e 內任何 commit 一律用專屬身分 test-auto-bot，
+      # 不靠共用 sysnapse 帳號的 actor/author（共用帳號下分辨不到兩個 bot）。
+      GIT_AUTHOR_NAME: test-auto-bot
+      GIT_AUTHOR_EMAIL: test-auto-bot@users.noreply.github.com
+      GIT_COMMITTER_NAME: test-auto-bot
+      GIT_COMMITTER_EMAIL: test-auto-bot@users.noreply.github.com
     steps:
       - name: Checkout harness
         uses: actions/checkout@v4
@@ -45,7 +52,11 @@ jobs:
         with:
           repository: sysnapse/rakazo
           ref: ${{ inputs.sha }}
-          # 唯讀 token：pull=true / push=false / admin=false（流程.md §21.3）
+          # secret RAKAZO_READ_PAT 的名字是歷史遺留：自 2026-11-16T06:08:43Z 起
+          # 其值是 sysnapse 帳號 token，對 sysnapse/rakazo 實為 admin/push 全開。
+          # 「寫不回產品 repo」不靠權限，靠：本 workflow 無任何寫入步驟 +
+          # persist-credentials: false（token 不留在 .git/config）+
+          # permissions: contents/actions read（流程.md §21.3、§21.3b(b)）。
           token: ${{ secrets.RAKAZO_READ_PAT }}
           path: rakazo-src
           persist-credentials: false
