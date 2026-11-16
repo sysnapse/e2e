@@ -1,0 +1,89 @@
+name: rakazo-mobile
+
+# 觸發：gh workflow run rakazo-mobile.yml -R sysnapse/e2e -f sha=<rakazo sha> [-f spec=<path filter>]
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: '要測的 sysnapse/rakazo commit sha（必填）'
+        required: true
+        type: string
+      spec:
+        description: '可選：spec 檔路徑篩選（Playwright 位置參數）'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: rakazo-mobile-${{ inputs.sha }}
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    name: rakazo mobile e2e @ ${{ inputs.sha }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout harness
+        uses: actions/checkout@v4
+
+      - name: Echo target sha (evidence for delivery)
+        run: |
+          echo "TARGET_REPO=sysnapse/rakazo"
+          echo "TARGET_SHA=${{ inputs.sha }}"
+          echo "SPEC=${{ inputs.spec }}"
+          echo "HARNESS_SHA=${{ github.sha }}"
+          echo "RUN_ID=${{ github.run_id }}"
+
+      - name: Checkout sysnapse/rakazo at requested sha (read-only token)
+        uses: actions/checkout@v4
+        with:
+          repository: sysnapse/rakazo
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.RAKAZO_READ_PAT }}
+          path: rakazo-src
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify checked-out sha matches request
+        working-directory: rakazo-src
+        run: |
+          got="$(git rev-parse HEAD)"
+          echo "CHECKED_OUT_SHA=$got"
+          test "$got" = "${{ inputs.sha }}" || { echo "::error::sha mismatch: wanted ${{ inputs.sha }} got $got"; exit 1; }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Run mobile Playwright (skips honestly when no config)
+        working-directory: rakazo/mobile
+        env:
+          RAKAZO_SRC: ${{ github.workspace }}/rakazo-src
+        run: |
+          if [ ! -f playwright.config.ts ] && [ ! -f playwright.config.js ]; then
+            echo "no playwright.config.ts in rakazo/mobile, skipping (this is a SKIP, not a pass)"
+            exit 0
+          fi
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          if [ -n "${{ inputs.spec }}" ]; then
+            npx playwright test "${{ inputs.spec }}" --reporter=list,json
+          else
+            npx playwright test --reporter=list,json
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rakazo-mobile-results
+          path: |
+            rakazo/mobile/results
+            rakazo/mobile/playwright-report
+          if-no-files-found: ignore
+          retention-days: 14
