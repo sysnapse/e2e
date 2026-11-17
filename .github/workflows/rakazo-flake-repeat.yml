@@ -1,0 +1,195 @@
+name: rakazo flake repeat
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "sysnapse/rakazo commit under test (required)"
+        required: true
+      spec:
+        description: "--spec= value handed to the e2e harness"
+        required: false
+        default: bot-organization.spec.ts
+      grep:
+        description: "--grep= value handed to the e2e harness"
+        required: false
+        default: group chats share every context-menu action
+      repeats:
+        description: "Total samples wanted (jobs x per_job should be >= this)"
+        required: false
+        default: "20"
+      jobs:
+        description: "Number of parallel jobs (matrix size)"
+        required: false
+        default: "4"
+      per_job:
+        description: "Samples measured by each job"
+        required: false
+        default: "5"
+permissions:
+  contents: read
+concurrency:
+  group: rakazo-flake-${{ inputs.sha }}-${{ inputs.spec }}
+  cancel-in-progress: false
+env:
+  TARGET_REPO: sysnapse/rakazo
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Build job matrix and check sample budget
+        id: matrix
+        env:
+          JOBS: ${{ inputs.jobs }}
+          PER_JOB: ${{ inputs.per_job }}
+          REPEATS: ${{ inputs.repeats }}
+        run: |
+          set -euo pipefail
+          echo "matrix=[$(seq 1 "$JOBS" | paste -sd, -)]" >> "$GITHUB_OUTPUT"
+          budget=$((JOBS * PER_JOB))
+          echo "jobs=$JOBS per_job=$PER_JOB repeats=$REPEATS budget=$budget"
+          if [ "$budget" -lt "$REPEATS" ]; then echo "::warning::budget $budget < repeats $REPEATS"; fi
+  measure:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout harness repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Print evidence
+        run: |
+          echo "TARGET_REPO=${TARGET_REPO}"
+          echo "TARGET_SHA=${{ inputs.sha }}"
+          echo "SPEC=${{ inputs.spec }}"
+          echo "GREP=${{ inputs.grep }}"
+          echo "REPEATS=${{ inputs.repeats }}"
+          echo "JOBS=${{ inputs.jobs }}"
+          echo "HARNESS_SHA=$(git rev-parse HEAD)"
+          echo "RUN_ID=${{ github.run_id }}"
+      - name: Checkout rakazo at target sha
+        uses: actions/checkout@v4
+        with:
+          repository: sysnapse/rakazo
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.RAKAZO_READ_PAT }}
+          path: rakazo-src
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify target sha and clean checkout
+        run: |
+          set -euo pipefail
+          actual=$(git -C rakazo-src rev-parse HEAD)
+          [ "$actual" = "${{ inputs.sha }}" ] || { echo "::error::rakazo-src HEAD $actual != requested ${{ inputs.sha }}"; exit 1; }
+          [ -z "$(git -C rakazo-src status --porcelain)" ] || { echo "::error::rakazo-src is not clean after checkout"; git -C rakazo-src status --porcelain; exit 1; }
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: rakazo-src/package.json
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: rakazo-src/pnpm-lock.yaml
+      - name: Install dependencies and Chromium
+        working-directory: rakazo-src
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @rakazo/web exec playwright install chromium
+      - name: Measure flake samples
+        working-directory: rakazo-src
+        env:
+          JOB: ${{ matrix.job }}
+          SPEC: ${{ inputs.spec }}
+          GREP: ${{ inputs.grep }}
+          PER_JOB: ${{ inputs.per_job }}
+          OUT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          csv="$OUT/samples.csv"
+          reasons="$OUT/invalid-reasons.txt"
+          printf 'job,i,verdict,rc,elapsed_s\n' > "$csv"
+          : > "$reasons"
+          for i in $(seq 1 "$PER_JOB"); do
+            db="flake_${JOB}_${i}"
+            PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 \
+              -c "CREATE DATABASE ${db}"
+            log="$OUT/iter-${JOB}-${i}.log"
+            start=$(date +%s)
+            set +e
+            CI_POSTGRES_URL="postgres://postgres:postgres@127.0.0.1:5432/${db}" \
+              pnpm test:e2e -- --spec="$SPEC" --grep="$GREP" 2>&1 | tee "$log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            elapsed=$(( $(date +%s) - start ))
+            if grep -qE '[0-9]+ failed' "$log"; then
+              verdict=FAIL
+            elif grep -qE '[0-9]+ passed' "$log"; then
+              verdict=PASS
+            else
+              verdict=INVALID
+              note="no passed/failed line"
+              if grep -qiE 'error|timed out|ECONNREFUSED' "$log"; then
+                note="no passed/failed line, error output present"
+              fi
+              echo "${JOB},${i}: ${note}" >> "$reasons"
+            fi
+            echo "${JOB},${i},${verdict},${rc},${elapsed}" >> "$csv"
+          done
+      - name: Upload samples and traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-${{ inputs.sha }}-job-${{ matrix.job }}
+          path: |
+            samples.csv
+            iter-*.log
+            invalid-reasons.txt
+            rakazo-src/apps/web/test-results
+            rakazo-src/blob-report
+            rakazo-src/playwright-report
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Summarize flake rate
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f samples.csv ]; then
+            echo "::error::samples.csv is missing, nothing was measured"
+            exit 1
+          fi
+          total=$(( $(wc -l < samples.csv) - 1 ))
+          pass=$(awk -F, 'NR>1 && $3=="PASS"' samples.csv | wc -l)
+          fail=$(awk -F, 'NR>1 && $3=="FAIL"' samples.csv | wc -l)
+          invalid=$(awk -F, 'NR>1 && $3=="INVALID"' samples.csv | wc -l)
+          valid=$((pass + fail))
+          echo "samples=$total pass=$pass fail=$fail invalid=$invalid valid=$valid"
+          if [ "$valid" -gt 0 ]; then
+            echo "flake_rate=$(awk -v f="$fail" -v v="$valid" 'BEGIN { printf "%.4f", f / v }')"
+          else
+            echo "flake_rate=undefined (valid=0)"
+          fi
+          [ "$invalid" -eq 0 ] || { echo "INVALID samples, excluded from denominator:"; cat invalid-reasons.txt; }
+          [ "$valid" -gt 0 ] || { echo "::error::no valid samples (PASS+FAIL=0), cannot measure a flake rate"; exit 1; }
